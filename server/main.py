@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
+from datetime import datetime, timedelta
 from pydantic import BaseModel
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
@@ -89,6 +90,8 @@ class DemandForecast(BaseModel):
     forecasted_demand: int
     trend: str
     period: str
+    unit_cost: float
+    lead_time_days: int
 
 class BacklogItem(BaseModel):
     id: str
@@ -119,6 +122,16 @@ class CreatePurchaseOrderRequest(BaseModel):
     unit_cost: float
     expected_delivery_date: str
     notes: Optional[str] = None
+
+# Restocking: the client sends only sku + quantity. Unit cost and lead time are
+# looked up server-side from the demand forecast so prices can't be forged.
+class RestockOrderItem(BaseModel):
+    sku: str
+    quantity: int
+
+class CreateRestockOrderRequest(BaseModel):
+    items: List[RestockOrderItem]
+    budget: Optional[float] = None
 
 # API endpoints
 @app.get("/")
@@ -303,6 +316,62 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+@app.post("/api/restocking/orders", response_model=Order, status_code=201)
+def create_restocking_order(request: CreateRestockOrderRequest):
+    """Create a restocking order from demand-forecast items.
+
+    Pricing is authoritative: unit cost and lead time are looked up from the
+    demand forecast by SKU, so client-supplied prices are never trusted. The
+    order is appended to the in-memory orders list (resets on restart) with
+    status "Submitted" so it surfaces in the Orders view.
+    """
+    if not request.items:
+        raise HTTPException(status_code=400, detail="No items provided")
+
+    # Index forecasts by SKU for cost/lead-time lookup
+    forecast_by_sku = {f["item_sku"]: f for f in demand_forecasts}
+
+    order_items = []
+    total_value = 0.0
+    max_lead_time = 0  # whole order lands when its slowest item arrives
+    for item in request.items:
+        forecast = forecast_by_sku.get(item.sku)
+        if not forecast:
+            raise HTTPException(status_code=400, detail=f"Unknown SKU: {item.sku}")
+        if item.quantity <= 0:
+            raise HTTPException(status_code=400, detail=f"Quantity must be positive for {item.sku}")
+
+        unit_cost = forecast["unit_cost"]
+        max_lead_time = max(max_lead_time, forecast["lead_time_days"])
+        total_value += unit_cost * item.quantity
+        order_items.append({
+            "sku": item.sku,
+            "name": forecast["item_name"],
+            "quantity": item.quantity,
+            "unit_price": unit_cost
+        })
+
+    # Derive the next id/number from existing orders (ids are numeric strings)
+    next_id = max((int(o["id"]) for o in orders), default=0) + 1
+    order_date = datetime.now()
+    expected_delivery = order_date + timedelta(days=max_lead_time)
+
+    new_order = {
+        "id": str(next_id),
+        "order_number": f"RSK-{order_date.year}-{next_id:04d}",
+        "customer": "Internal Restock",
+        "items": order_items,
+        "status": "Submitted",
+        "order_date": order_date.isoformat(timespec="seconds"),
+        "expected_delivery": expected_delivery.isoformat(timespec="seconds"),
+        "total_value": round(total_value, 2),
+        "actual_delivery": None,
+        "warehouse": None,
+        "category": None
+    }
+    orders.append(new_order)
+    return new_order
 
 if __name__ == "__main__":
     import uvicorn

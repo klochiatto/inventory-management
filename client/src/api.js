@@ -102,5 +102,12 @@ export const api = {
   async getPurchaseOrderByBacklogItem(backlogItemId) {
     const response = await axios.get(`${API_BASE_URL}/purchase-orders/${backlogItemId}`)
     return response.data
+  },
+
+  // Submit a restocking order. Payload carries only { sku, quantity } per item;
+  // the server looks up cost/lead-time and computes the total.
+  async createRestockingOrder(orderData) {
+    const response = await axios.post(`${API_BASE_URL}/restocking/orders`, orderData)
+    return response.data
   }
 }
